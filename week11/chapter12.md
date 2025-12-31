@@ -1,186 +1,129 @@
-# 💾 12장 로그와 빅데이터
+# 💾 12장 웹 소켓으로 실시간 데이터 전송하기
 
-마이크로서비스 아키텍처(MSA)에서는 각 서비스가 독립적으로 로그를 발생시킴. 이를 개별적으로 관리하면 수집 비용이 크고 유지보수가 어렵기 때문에, **로그 전용 마이크로서비스**를 구축하여 중앙 집중식으로 관리함.
+실시간성이 중요한 서비스를 구현하기 위한 기술들을 다룬다.
 
-## 12.1 핵심 개념
+## 12.1 웹 소켓 이해하기
 
-* **통합 관리:** 모든 서비스의 로그를 한곳으로 모아 효율적으로 관리함.
-* **유연한 확장:** 로그 저장소(파일, DB, Elasticsearch 등)가 변경되어도 개별 마이크로서비스를 수정할 필요가 없음.
-* **데이터 분석:** 수집된 로그를 빅데이터 솔루션과 연동하여 시각화 및 분석이 가능함.
+| 기술 | 특징 | 비고 |
+| --- | --- | --- |
+| **폴링 (Polling)** | 주기적으로 HTTP 요청을 보내 업데이트 확인 | 단순하지만 서버 리소스 낭비 심함 |
+| **SSE (Server Sent Events)** | 서버에서 클라이언트로만 데이터를 전송 (단방향) | `EventSource` 객체 사용 |
+| **웹 소켓 (Web Socket)** | 한 번 연결되면 유지되는 실시간 양방향 통신 | `WS` 프로토콜 사용 |
+
+### 웹 소켓의 핵심 요약
+
+* **양방향성:** 클라이언트와 서버가 서로 데이터를 주고받음.
+* **효율성:** HTTP와 포트를 공유할 수 있으며 연결 오버헤드가 적음.
+* **상태:** `CONNECTING` → `OPEN` → `CLOSING` → `CLOSED` (메시지는 `OPEN` 상태에서만 가능).
 
 ---
 
-## 12.2 주요 소스 코드
+## 12.2 `ws` 모듈로 웹 소켓 사용하기
 
-### 1) server.js (공통 서버 클래스)
+가벼운 서비스를 구축하거나 웹 소켓 표준에 가깝게 구현할 때 사용함.
 
-모든 마이크로서비스의 부모가 되는 클래스로, 로그 서비스로 데이터를 전송하는 로직이 추가됨.
+### [Server] socket.js
 
 ```javascript
-'use strict';
-const net = require('net');
-const tcpClient = require('./client.js');
+const WebSocket = require('ws');
 
-class tcpServer {
-    constructor(name, port, urls) {
-        this.logTcpClient = null;  // 로그 서비스 연결용 클라이언트
-        this.context = { port: port, name: name, urls: urls };
-        this.merge = {};
+module.exports = (server) => {
+    const wss = new WebSocket.Server({ server }); // Express 서버 연결
 
-        this.server = net.createServer((socket) => {
-            this.onCreate(socket);
+    wss.on('connection', (ws, req) => {
+        const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+        console.log('새로운 클라이언트 접속', ip);
 
-            socket.on('error', (exception) => { this.onClose(socket); });
-            socket.on('close', () => { this.onClose(socket); });
-
-            // 데이터 수신 시 로그 전송 및 로직 실행
-            socket.on('data', (data) => {
-                var key = socket.remoteAddress + ":" + socket.remotePort;
-                var sz = this.merge[key] ? this.merge[key] + data.toString() : data.toString();
-                var arr = sz.split('¶');
-                for (var n in arr) {
-                    if (sz.charAt(sz.length - 1) != '¶' && n == arr.length - 1) {
-                        this.merge[key] = arr[n];
-                        break;
-                    } else if (arr[n] == "") {
-                        break;
-                    } else {
-                        this.writeLog(arr[n]); // ➊ 로그 전송
-                        this.onRead(socket, JSON.parse(arr[n]));
-                    }
-                }
-            });
+        ws.on('message', (message) => { console.log(message.toString()); });
+        ws.on('error', (error) => { console.error(error); });
+        ws.on('close', () => {
+            console.log('클라이언트 접속 해제', ip);
+            clearInterval(ws.interval);
         });
 
-        this.server.on('error', (err) => { console.log(err); });
-        this.server.listen(port, () => {
-            console.log('listen', this.server.address());
-        });
-    }
-
-    onCreate(socket) { console.log("onCreate", socket.remoteAddress, socket.remotePort); }
-    onClose(socket) { console.log("onClose", socket.remoteAddress, socket.remotePort); }
-
-    // Distributor 접속 및 로그 서비스 정보 수신
-    connectToDistributor(host, port, onNoti) {
-        var packet = { uri: "/distributes", method: "POST", key: 0, params: this.context };
-        var isConnectedDistributor = false;
-
-        this.clientDistributor = new tcpClient(
-            host, port,
-            (options) => { // 접속 완료
-                isConnectedDistributor = true;
-                this.clientDistributor.write(packet);
-            },
-            (options, data) => { // 데이터 수신
-                // ➋ 로그 마이크로서비스 접속 정보 확인 시 연결 시도
-                if (this.logTcpClient == null && this.context.name != 'logs') {
-                    for (var n in data.params) {
-                        const ms = data.params[n];
-                        if (ms.name == 'logs') {
-                            this.connectToLog(ms.host, ms.port);
-                            break;
-                        }
-                    }
-                }
-                onNoti(data);
-            },
-            (options) => { isConnectedDistributor = false; },
-            (options) => { isConnectedDistributor = false; }
-        );
-
-        setInterval(() => {
-            if (isConnectedDistributor != true) { this.clientDistributor.connect(); }
+        // 3초마다 클라이언트로 상태 메시지 전송
+        ws.interval = setInterval(() => {
+            if (ws.readyState === ws.OPEN) {
+                ws.send('서버에서 메시지를 보냅니다.');
+            }
         }, 3000);
-    }
-
-    // 로그 서비스 연결 함수
-    connectToLog(host, port) {
-        this.logTcpClient = new tcpClient(
-            host, port,
-            (options) => { },
-            (options) => { this.logTcpClient = null; },
-            (options) => { this.logTcpClient = null; }
-        );
-        this.logTcpClient.connect();
-    }
-
-    // ➌ 로그 데이터 전송 실행
-    writeLog(log) {
-        if (this.logTcpClient) {
-            const packet = { uri: "/logs", method: "POST", key: 0, params: log };
-            this.logTcpClient.write(packet);
-        } else {
-            console.log(log); // 로그 서비스 미연결 시 콘솔 출력
-        }
-    }
-}
-
-module.exports = tcpServer;
-
-```
-
-### 2) microservice_logs_elasticsearch.js (로그 관리 서비스)
-
-수신한 로그를 파일(`fs`)과 `Elasticsearch`에 동시에 저장하는 실제 서비스 코드임.
-
-```javascript
-'use strict';
-const cluster = require('cluster');
-const fs = require('fs');
-const elasticsearch = new require('elasticsearch').Client({
-    host: '127.0.0.1:9200',
-    log: 'trace'
-});
-
-class logs extends require('./server.js') {
-    constructor() {
-        super("logs", process.argv[2] ? Number(process.argv[2]) : 9040, ["POST/logs"]);
-
-        // ➊ 로그 파일 스트림 생성 (Append 모드)
-        this.writestream = fs.createWriteStream('./log.txt', { flags: 'a' });
-
-        this.connectToDistributor("127.0.0.1", 9000, (data) => {
-            console.log("Distributor Notification", data);
-        });
-    }
-
-    onRead(socket, data) {
-        const sz = new Date().toLocaleString() + '\t' + socket.remoteAddress + '\t' +
-                   socket.remotePort + '\t' + JSON.stringify(data) + '\n';
-        
-        console.log(sz);
-        this.writestream.write(sz);                 // ➋ 파일 저장
-
-        data.timestamp = new Date().toISOString();  // 타임스탬프 추가
-        data.params = JSON.parse(data.params);      // 파라미터 변환
-        
-        // ➌ Elasticsearch 색인 저장
-        elasticsearch.index({
-            index: 'microservice',
-            type: 'logs',
-            body: data
-        });
-    }
-}
-
-// 클러스터 모드 실행
-if (cluster.isMaster) {
-    cluster.fork();
-    cluster.on('exit', (worker, code, signal) => {
-        console.log(`worker ${worker.process.pid} died`);
-        cluster.fork();
     });
-} else {
-    new logs();
-}
+};
 
 ```
 
 ---
 
-## 12.3 정리 및 결론
+## 12.3 Socket.IO 사용하기
 
-* **로그 관리 서비스**를 별도로 운영하면 전체 시스템의 유지보수 비용이 절감됨.
-* `fs` 모듈의 스트림 기능을 활용해 효율적인 파일 로그 기록이 가능함.
-* **Elasticsearch** 및 **Kibana**와 연동하여 단순 텍스트 로그를 넘어선 빅데이터 분석 환경을 쉽게 구축할 수 있음.
+웹 소켓을 지원하지 않는 브라우저에서도 **HTTP 폴링으로 자동 강하(Fallback)**하여 호환성을 확보함.
+
+### 1) 서버 로직 (socket.js)
+
+```javascript
+const SocketIO = require('socket.io');
+
+module.exports = (server) => {
+    const io = SocketIO(server, { path: '/socket.io' });
+
+    io.on('connection', (socket) => {
+        const req = socket.request;
+        const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+        
+        socket.on('disconnect', () => {
+            console.log('접속 해제', socket.id);
+            clearInterval(socket.interval);
+        });
+        
+        socket.on('reply', (data) => { console.log(data); }); // 사용자 정의 이벤트
+        
+        socket.interval = setInterval(() => {
+            socket.emit('news', 'Hello Socket.IO'); // 'news'라는 키로 데이터 전송
+        }, 3000);
+    });
+};
+
+```
+
+### 2) 클라이언트 구현 (index.html)
+
+```html
+<script src="/socket.io/socket.io.js"></script>
+<script>
+    const socket = io.connect('http://localhost:8005', {
+        path: '/socket.io',
+        transports: ['websocket'], // 처음부터 웹소켓만 사용하고 싶을 때 설정
+    });
+
+    socket.on('news', (data) => {
+        console.log(data);
+        socket.emit('reply', 'Hello Node.JS');
+    });
+</script>
+
+```
+
+---
+
+## 12.5 미들웨어와 소켓 연결하기
+
+### 미들웨어와 세션 공유
+
+* **세션 쿠키 직접 설정:** 서버 내부(socket.js)에서 axios 요청을 보낼 때는 브라우저와 달리 쿠키가 자동 포함되지 않음. `connect.sid` 세션 쿠키를 직접 헤더에 설정해야 요청자를 판단할 수 있음.
+* **Express 연결:** `app.set('io', io)`를 사용하여 라우터에서 `req.app.get('io')`로 소켓 객체를 가져올 수 있음.
+
+### Socket.IO 주요 API
+
+* **특정인에게 전송:** `socket.to(소켓_아이디).emit(이벤트, 데이터)`
+* **나를 제외한 전체 전송:** `socket.broadcast.emit(이벤트, 데이터)`
+* **특정 방을 제외한 전송:** `socket.broadcast.to(방아이디).emit(이벤트, 데이터)`
+
+---
+
+## 12.7 핵심 정리
+
+1. **포트 공유:** 웹 소켓과 HTTP는 동일한 포트를 사용함으로 별도 설정이 불필요함.
+2. **브라우저 호환성:** Socket.IO는 구형 브라우저 대응이 용이함.
+3. **네임스페이스와 방:** 데이터를 필요한 사용자(특정 그룹)에게만 타겟팅해서 보낼 수 있음.
+4. **라우터 연동:** 복잡한 DB 조작이 동반되는 경우, 소켓 직접 통신보다 **HTTP 라우터를 거친 후 소켓으로 알림을 보내는 방식**이 더 안정적임.
+
